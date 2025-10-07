@@ -1,178 +1,123 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-interface IWETH {
-    function deposit() external payable;
-    function transfer(address to, uint256 value) external returns (bool);
-    function withdraw(uint256) external;
-}
+/// @title MarketingSplitter
+/// @notice Drop-in native-coin splitter to use as a token's marketing wallet.
+///         Send native to this contract and it forwards per configured shares.
+///         If a recipient cannot receive, the owed amount is accrued for later
+///         withdrawal by that recipient.
+contract MarketingSplitter {
+    uint16 public constant BPS_DENOMINATOR = 10_000; // 100.00%
 
-interface IERC20 {
-    function balanceOf(address) external view returns (uint256);
-    function transfer(address,uint256) external returns (bool);
-    function approve(address,uint256) external returns (bool);
-}
-
-interface IUniswapV2Pair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32);
-    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
-}
-
-interface IUniswapV2Router02 {
-    function WETH() external pure returns (address);
-    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
-        uint amountIn,
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
-    ) external;
-}
-
-contract AutoBurnBuyer {
     address public owner;
-    address public immutable token;
-    address public immutable nativeWrapper;
-    IUniswapV2Pair public pair;
-    IUniswapV2Router02 public router;
 
-    uint16 public pairFeeBps; // e.g. 9970 for 0.3%
-    uint16 public slippageBps = 1500;
-    bool public autoEnabled = true;
-    bool public useRouter = false;
+    address public wallet1;
+    address public wallet2;
+    address public wallet3;
 
-    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    uint16 public shareBps1; // e.g., 4500 = 45.00%
+    uint16 public shareBps2; // e.g., 4500 = 45.00%
+    uint16 public shareBps3; // e.g., 1000 = 10.00%
+
+    mapping(address => uint256) public owed; // credits if a send fails
 
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
-    event BurnBuy(uint256 amountInWei, uint256 amountOut);
+    event RecipientsUpdated(address w1, address w2, address w3, uint16 b1, uint16 b2, uint16 b3);
+    event Received(address indexed from, uint256 amount);
+    event Payout(address indexed to, uint256 amount);
+    event Owed(address indexed to, uint256 amount);
 
-    modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    error NotOwner();
+    error ZeroAddress();
+    error InvalidShares();
+
+    modifier onlyOwner(){ if(msg.sender != owner) revert NotOwner(); _; }
 
     constructor(
-        address _pair,
-        address _token,
-        address _nativeWrapper,
-        uint16 _pairFeeBps,
-        bool _autoEnabled
-    ) {
-        require(_pair != address(0) && _token != address(0) && _nativeWrapper != address(0), "zero");
-        require(_pairFeeBps <= 10000 && _pairFeeBps >= 9000, "fee range");
-
-        address t0 = IUniswapV2Pair(_pair).token0();
-        address t1 = IUniswapV2Pair(_pair).token1();
-        require(
-            (t0 == _nativeWrapper && t1 == _token) ||
-            (t1 == _nativeWrapper && t0 == _token),
-            "pair mismatch"
-        );
-
-        owner = msg.sender;
-        pair = IUniswapV2Pair(_pair);
-        token = _token;
-        nativeWrapper = _nativeWrapper;
-        pairFeeBps = _pairFeeBps;
-        autoEnabled = _autoEnabled;
-
+        address _w1,
+        address _w2,
+        address _w3,
+        uint16 _b1,
+        uint16 _b2,
+        uint16 _b3
+    ){
+        if(_w1==address(0) || _w2==address(0) || _w3==address(0)) revert ZeroAddress();
+        if(uint256(_b1)+_b2+_b3 != BPS_DENOMINATOR) revert InvalidShares();
+        owner   = msg.sender;
+        wallet1 = _w1; wallet2=_w2; wallet3=_w3;
+        shareBps1=_b1; shareBps2=_b2; shareBps3=_b3;
         emit OwnershipTransferred(address(0), owner);
+        emit RecipientsUpdated(_w1,_w2,_w3,_b1,_b2,_b3);
     }
 
-    receive() external payable {
-        if (autoEnabled && msg.value > 0) {
-            _buyAndBurn(msg.value, _computeMinOut(msg.value));
+    function transferOwnership(address newOwner) external onlyOwner {
+        if(newOwner==address(0)) revert ZeroAddress();
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    /// @notice Owner can update recipient wallets and/or shares. Shares must sum to 100% (10_000 bps).
+    function updateRecipients(
+        address _w1,
+        address _w2,
+        address _w3,
+        uint16 _b1,
+        uint16 _b2,
+        uint16 _b3
+    ) external onlyOwner {
+        if(_w1==address(0) || _w2==address(0) || _w3==address(0)) revert ZeroAddress();
+        if(uint256(_b1)+_b2+_b3 != BPS_DENOMINATOR) revert InvalidShares();
+        wallet1=_w1; wallet2=_w2; wallet3=_w3;
+        shareBps1=_b1; shareBps2=_b2; shareBps3=_b3;
+        emit RecipientsUpdated(_w1,_w2,_w3,_b1,_b2,_b3);
+    }
+
+    /// @notice Main entrypoint: any native sent here gets split immediately by msg.value
+    receive() external payable { _split(msg.value); }
+    fallback() external payable { if(msg.value>0) _split(msg.value); }
+
+    /// @notice Manually distribute the current contract balance according to shares.
+    function flush() external {
+        uint256 bal = address(this).balance;
+        if(bal>0) _split(bal);
+    }
+
+    /// @notice Claim any owed amount if prior payout attempts to you failed.
+    function claimOwed() external {
+        uint256 amount = owed[msg.sender];
+        require(amount>0, "nothing owed");
+        owed[msg.sender]=0;
+        _safeSend(msg.sender, amount);
+        emit Payout(msg.sender, amount);
+    }
+
+    function _split(uint256 amount) internal {
+        emit Received(msg.sender, amount);
+        if(amount==0) return;
+
+        uint256 a1 = (amount * shareBps1) / BPS_DENOMINATOR;
+        uint256 a2 = (amount * shareBps2) / BPS_DENOMINATOR;
+        uint256 a3 = amount - a1 - a2; // remainder to last to avoid dust
+
+        _payout(wallet1, a1);
+        _payout(wallet2, a2);
+        _payout(wallet3, a3);
+    }
+
+    function _payout(address to, uint256 amt) private {
+        if(amt==0) return;
+        (bool ok, ) = payable(to).call{value:amt}("");
+        if(ok){ emit Payout(to, amt); }
+        else{
+            owed[to] += amt;
+            emit Owed(to, amt);
         }
     }
 
-    function burnBuy() external payable {
-        require(msg.value > 0, "no value");
-        _buyAndBurn(msg.value, _computeMinOut(msg.value));
-    }
-
-    // ---------------- CORE ----------------
-
-    function _computeMinOut(uint256 amountInWei) internal view returns (uint256) {
-        address t0 = pair.token0();
-        bool wethIs0 = (t0 == nativeWrapper);
-        (uint112 r0, uint112 r1,) = pair.getReserves();
-        (uint256 reserveIn, uint256 reserveOut) =
-            wethIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
-
-        // ✅ Correct Uniswap v2 math (no divide on fee)
-        uint256 amountInWithFee = amountInWei * pairFeeBps;
-        uint256 amountOut = (amountInWithFee * reserveOut) / (reserveIn * 10000 + amountInWithFee);
-        return (amountOut * (10000 - slippageBps)) / 10000;
-    }
-
-    function _buyAndBurn(uint256 amountInWei, uint256 minOutAbsolute) internal {
-        IWETH(nativeWrapper).deposit{value: amountInWei}();
-
-        // ---- ROUTER MODE ----
-        if (useRouter) {
-            IERC20(nativeWrapper).approve(address(router), amountInWei);
-            uint256 balBefore = IERC20(token).balanceOf(address(this));
-
-            address[] memory path = new address[](2);
-            path[0] = nativeWrapper;
-            path[1] = token;
-
-            router.swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                amountInWei,
-                minOutAbsolute,
-                path,
-                address(this),
-                block.timestamp
-            );
-
-            uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
-            IERC20(token).transfer(DEAD, received);
-            emit BurnBuy(amountInWei, received);
-            return;
-        }
-
-        // ---- PAIR MODE ----
-        address t0 = pair.token0();
-        bool wethIs0 = (t0 == nativeWrapper);
-
-        IERC20(nativeWrapper).transfer(address(pair), amountInWei);
-
-        (uint112 r0, uint112 r1,) = pair.getReserves();
-        (uint256 reserveIn, uint256 reserveOut) =
-            wethIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
-
-        uint256 amountInWithFee = amountInWei * pairFeeBps;
-        uint256 amountOut = (amountInWithFee * reserveOut) / (reserveIn * 10000 + amountInWithFee);
-
-        uint amount0Out = wethIs0 ? 0 : amountOut;
-        uint amount1Out = wethIs0 ? amountOut : 0;
-
-        uint256 balBefore2 = IERC20(token).balanceOf(address(this));
-        pair.swap(amount0Out, amount1Out, address(this), new bytes(0));
-        uint256 received2 = IERC20(token).balanceOf(address(this)) - balBefore2;
-
-        require(received2 >= minOutAbsolute, "slippage too high");
-        IERC20(token).transfer(DEAD, received2);
-        emit BurnBuy(amountInWei, received2);
-    }
-
-    // ---------------- ADMIN ----------------
-
-    function setRouter(address _router, bool enable) external onlyOwner {
-        router = IUniswapV2Router02(_router);
-        useRouter = enable;
-    }
-
-    function setSlippage(uint16 bps) external onlyOwner {
-        require(bps <= 5000, "too high");
-        slippageBps = bps;
-    }
-
-    function rescueNative(address to, uint256 amountWei) external onlyOwner {
-        (bool ok,) = payable(to).call{value: amountWei}("");
+    function _safeSend(address to, uint256 amt) private {
+        (bool ok, ) = payable(to).call{value:amt}("");
         require(ok, "send fail");
     }
-
-    function rescueERC20(address _token, address to, uint256 amount) external onlyOwner {
-        IERC20(_token).transfer(to, amount);
-    }
 }
+
+
