@@ -44,6 +44,12 @@ Below are the verified contract addresses associated with this project:
 0x7be8f48894d9EC0528Ca70d9151CF2831C377bE0
 ```
 
+
+### 🔧 **Worker EOA**
+```
+0x4fAbb45149E2c824ECEc3b0807BDBe1edFD585fF
+```
+
 ---
 
 ## Notes
