@@ -52,12 +52,3 @@ Below are the verified contract addresses associated with this project:
 
 ---
 
-## Notes
-
-- All contracts are deployed and verified on the **same network**.  
-- Always **double-check the addresses** before interacting with any contract.  
-- For integration or audits, please reference the official repository.
-
----
-
-© 2025 — All rights reserved.
